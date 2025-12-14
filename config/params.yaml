@@ -16,13 +16,14 @@ paths:
   tmp_root: "./outputs/tmp"
   reports_dir: "./outputs/reports"
   targets_dir: "./outputs/targets"
-  rfdiffusion_repo: "./external/RFdiffusion"
+  rfdiffusion3_repo: "./external/RFdiffusion3"
   proteinmpnn: "./external/ProteinMPNN/protein_mpnn_run.py"
+  rosettafold3_repo: "./external/RosettaFold3"
   templates_dir: "./data/templates"      
   mettl1_pdb: "./data/3ckk.pdb"           
   complex_pdb: "./data/8d58.pdb"          
   reference_complex_for_mask: "./data/8d58.pdb" 
-  alphafold_ref_pdb: "./data/8d58.pdb"   
+  rosettafold3_ref_pdb: "./data/8d58.pdb"   
 
 scale:
   # RFdiffusion骨架1–2万；这里按批次控制，建议多批多次运行凑够量级
@@ -33,32 +34,35 @@ scale:
   max_backbones_refine: 500             # 精筛阶段骨架上限（防止爆量）
   dedup_rmsd_threshold: 2.0              # 结构去重聚类阈值（Å，CA RMSD 粗筛）
 
-rfdd:
+rfdd3:
   model_only_neighbors: true
   neighborhood_radius: 11.0
   inference_T: 50
   noise_scale: 0.2
+  # RFdiffusion3 specific parameters
+  diffusion_schedule: "linear"
+  model_version: "v3"
 
-af2:
-  # 两档参数：initial / refine；默认跑 with_template 路线
+rf3:
+  # RosettaFold3 parameters for initial and refine stages
   with_template:
     initial:
       num_models: 2
       num_recycles: 3
-      amber_relax: false
+      use_templates: true
     refine:
       num_models: 5
       num_recycles: 8
-      amber_relax: true
+      use_templates: true
   no_template:
     initial:
       num_models: 2
       num_recycles: 2
-      amber_relax: false
+      use_templates: false
     refine:
       num_models: 5
       num_recycles: 8
-      amber_relax: true
+      use_templates: false
 
 filters:
   initial:
@@ -103,14 +107,14 @@ compute:
   gpus: [0,1,2,3]
   halt_on_fail: false
   workers_per_gpu: 10 # <--- 从 2 开始！
-  max_concurrent_rf: 10
+  max_concurrent_rf3: 10
   max_concurrent_mpnn: 10
-  max_concurrent_af2_initial: 1
-  max_concurrent_af2_refine: 1
+  max_concurrent_rf3_initial: 1
+  max_concurrent_rf3_refine: 1
   min_free_mem_mb_for_gpu: 12000
   cpu_fallback: false
 
 cleanup:
-  keep_af2_top_k_per_target: 2
+  keep_rf3_top_k_per_target: 2
   remove_msas_after_stage: true
   compress_intermediates: true

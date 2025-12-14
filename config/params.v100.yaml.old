@@ -34,34 +34,32 @@ scale:
   max_backbones_refine: 500             # 精筛阶段骨架上限（防止爆量）
   dedup_rmsd_threshold: 2.0              # 结构去重聚类阈值（Å，CA RMSD 粗筛）
 
-rfdd3:
+rfdd:
   model_only_neighbors: true
   neighborhood_radius: 11.0
   inference_T: 50
   noise_scale: 1
-  diffusion_schedule: "linear"
-  model_version: "v3"
 
-rf3:
+af2:
   # 两档参数：initial / refine；默认跑 with_template 路线
   with_template:
     initial:
       num_models: 2
       num_recycles: 6
-      use_templates: true
+      amber_relax: false
     refine:
       num_models: 5
       num_recycles: 8
-      use_templates: true
+      amber_relax: true
   no_template:
     initial:
       num_models: 2
       num_recycles: 6
-      use_templates: false
+      amber_relax: false
     refine:
       num_models: 5
       num_recycles: 8
-      use_templates: false
+      amber_relax: true
 
 filters:
   initial:
@@ -106,14 +104,14 @@ compute:
   gpus: [0,1,2,3]
   halt_on_fail: false
   workers_per_gpu: 1 # <--- 从 2 开始！
-  max_concurrent_rf3: 5
+  max_concurrent_rf: 5
   max_concurrent_mpnn: 4
-  max_concurrent_rf3_initial: 1
-  max_concurrent_rf3_refine: 1
+  max_concurrent_af2_initial: 1
+  max_concurrent_af2_refine: 1
   min_free_mem_mb_for_gpu: 12000
   cpu_fallback: false
 
 cleanup:
-  keep_rf3_top_k_per_target: 2
+  keep_af2_top_k_per_target: 2
   remove_msas_after_stage: true
   compress_intermediates: true

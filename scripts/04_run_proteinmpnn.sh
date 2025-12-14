@@ -10,7 +10,7 @@ set -euo pipefail
 
 PARAMS=$1
 MPNN=$(python scripts/get_param_yaml.py $PARAMS paths.proteinmpnn)
-RFDIR=$(python scripts/get_param_yaml.py $PARAMS paths.work_dir)/rfdiffusion_raw
+RFDIR=$(python scripts/get_param_yaml.py $PARAMS paths.work_dir)/rfdiffusion3_raw
 OUTDIR=$(python scripts/get_param_yaml.py $PARAMS paths.work_dir)/mpnn_seqs
 LOGFILE="$OUTDIR/log.txt"
 mkdir -p "$OUTDIR"; : > "$LOGFILE"
