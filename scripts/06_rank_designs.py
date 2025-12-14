@@ -14,7 +14,7 @@ PARAMS = "config/params.yaml"
 with open(PARAMS) as f:
     P = yaml.safe_load(f)
 
-pred_dir = os.path.join(P["paths"]["work_dir"], "af2_models", "predictions")
+pred_dir = os.path.join(P["paths"]["work_dir"], "rf3_models", "predictions")
 report_dir = P["paths"]["reports_dir"]
 os.makedirs(report_dir, exist_ok=True)
 
