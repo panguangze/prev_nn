@@ -204,7 +204,12 @@ run_rf3_worker() {
     mkdir -p "$prediction_dir"
     
     # Run RosettaFold3 inference
-    # This is a placeholder command - adjust based on actual RF3 interface
+    # NOTE: This command structure is based on common RF3 interfaces.
+    # Adjust the script path and parameters according to your RosettaFold3 installation.
+    # Common alternatives:
+    #   - python "$RF3_REPO/run_rosettafold.py" ...
+    #   - python "$RF3_REPO/inference.py" ...
+    # Check your RosettaFold3 documentation for the exact command format.
     python "$RF3_REPO/run_rf3.py" \
       --input_fasta "$fasta" \
       --output_dir "$prediction_dir" \

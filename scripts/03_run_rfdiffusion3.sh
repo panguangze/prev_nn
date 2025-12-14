@@ -82,9 +82,9 @@ echo "[INFO] lenbins=${LENBINS[*]}" | tee -a "$LOGFILE"
 [ ${#LENBINS[@]} -gt 0 ]
 
 # ========================== 核心逻辑修改部分 ==========================
-# 1. 读取参数 'compute.max_concurrent_rf'，我们将其理解为“每个GPU希望运行的任务数”
-#    如果用户未设置，则默认为 1
-TASKS_PER_GPU=$(python scripts/get_param_yaml.py "$PARAMS" compute.max_concurrent_rf 2>/dev/null || echo 1)
+# 1. Read parameter 'compute.max_concurrent_rf3', interpreted as "number of tasks per GPU"
+# If not set, defaults to 1
+TASKS_PER_GPU=$(python scripts/get_param_yaml.py "$PARAMS" compute.max_concurrent_rf3 2>/dev/null || echo 1)
 
 # 2. 获取GPU列表和数量
 mapfile -t GPUS < <(python scripts/get_param_yaml.py "$PARAMS" compute.gpus --json | tr -d '[] ' | tr ',' '\n')
