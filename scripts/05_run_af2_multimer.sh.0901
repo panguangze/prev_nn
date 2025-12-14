@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 环境/标志
+if [[ -n "${XLA_FLAGS:-}" ]]; then
+  export XLA_FLAGS="$(echo "$XLA_FLAGS" | sed 's/--xla_gpu_enable_triton=false//g' | tr -s ' ')"
+fi
+PARAMS=$1
+OUTROOT=$(python scripts/get_param_yaml.py "$PARAMS" paths.work_dir)
+OUTDIR="$OUTROOT/af2_models"
+MPNN_DIR="$OUTROOT/mpnn_seqs"
+TEMPLATE_DIR=$(python scripts/get_param_yaml.py "$PARAMS" paths.templates_dir)
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/predictions" "$TEMPLATE_DIR"
+LOGFILE="$OUTDIR/log.txt"; : > "$LOGFILE"
+
+USE_TEMPLATE=$(python scripts/get_param_yaml.py "$PARAMS" project.use_template)
+NUM_MODELS=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_models)
+NUM_RECYCLES=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_recycles)
+AMBER=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.amber_relax)
+
+# Detect colabfold
+if command -v colabfold_batch >/dev/null 2>&1; then
+  COLABFOLD="colabfold_batch"
+else
+  COLABFOLD="python -m colabfold.batch"
+fi
+
+# 读取 GPU 列表（来自 params 或 CUDA_VISIBLE_DEVICES 或 nvidia-smi）
+discover_gpus() {
+  local cfg; local arr=()
+  cfg=$(python scripts/get_param_yaml.py "$PARAMS" compute.gpus --json 2>/dev/null || echo "")
+  if [[ -n "$cfg" && "$cfg" != "null" ]]; then
+    cfg=$(echo "$cfg" | tr -d '[]"' | tr ',' ' ')
+    read -r -a arr <<< "$cfg"
+  elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a arr <<< "$CUDA_VISIBLE_DEVICES"
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    mapfile -t arr < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+  fi
+  printf '%s\n' "${arr[@]}"
+}
+mapfile -t GPUS < <(discover_gpus)
+NGPU=${#GPUS[@]}
+
+# GPU 内存阈值检查
+MINFREE=$(python scripts/get_param_yaml.py "$PARAMS" compute.min_free_mem_mb_for_gpu)
+VALID_GPUS=()
+for g in "${GPUS[@]:-}"; do
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id="$g" 2>/dev/null || echo "0")
+  if [[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge "$MINFREE" ]; then
+    echo "[INFO] GPU $g free mem: $free MiB" >> "$LOGFILE"
+    VALID_GPUS+=("$g")
+  else
+    echo "[WARN] GPU $g low or unknown free mem ($free MiB), skipped" >> "$LOGFILE"
+  fi
+done
+if [ "${#VALID_GPUS[@]}" -eq 0 ]; then
+  echo "[ERROR] No sufficient GPU memory available." | tee -a "$LOGFILE"
+  exit 1
+fi
+
+# 准备 METTL1 序列
+python - <<'PY'
+import json
+from Bio.PDB import PDBParser, PPBuilder
+cand = json.load(open("./outputs/targets/interface_candidates.json"))
+pdb = cand["mettl1_target_pdb"]; chain_id = cand["mettl1_chain_id"]
+ppb=PPBuilder()
+s=PDBParser(QUIET=True).get_structure("T", pdb)
+seq=""
+for pp in ppb.build_peptides(s[0][chain_id]):
+    seq += str(pp.get_sequence())
+open("./outputs/targets/mettl1_seq.fa","w").write(">METTL1\n"+seq+"\n")
+print("[OK] METTL1 seq written.")
+PY
+
+clean_seq() {
+  local raw="${1:-}"
+  raw="$(echo "${raw:-}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')"
+  echo "$raw" | sed 's/[^ACDEFGHIKLMNPQRSTVWY]//g'
+}
+
+METTL1_SEQ_RAW=$(grep -v "^>" ./outputs/targets/mettl1_seq.fa | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]' || true)
+METTL1_SEQ=$(clean_seq "${METTL1_SEQ_RAW:-}")
+if [[ -z "${METTL1_SEQ:-}" ]]; then
+  echo "[ERROR] Empty METTL1 sequence after cleaning." | tee -a "$LOGFILE"
+  exit 1
+fi
+
+# 组装 FASTAs
+find "$MPNN_DIR" -type f -name "*.fa" | sort | while read -r seqfile; do
+  [[ -z "${seqfile:-}" || ! -s "$seqfile" ]] && { echo "[WARN] Empty seqfile: $seqfile" | tee -a "$LOGFILE"; continue; }
+  base="$(basename "${seqfile%.*}")"
+  stub="$OUTDIR/fasta/$base"; mkdir -p "$OUTDIR/fasta"
+  idx=1
+  awk 'BEGIN{RS=">"; FS="\n"} NR>1{hdr=$1; seq=""; for(i=2;i<=NF;i++) seq=seq $i; gsub(/\r/,"",seq); gsub(/[ \t\n]/,"",seq); if (seq!="") {print hdr; print seq;}}' "$seqfile" | \
+  while read -r header && read -r oneline; do
+    [[ -z "${oneline:-}" ]] && { echo "[WARN] Empty sequence in $base rec#$idx, skip." | tee -a "$LOGFILE"; idx=$((idx+1)); continue; }
+    part1="${oneline%%/*}"; rest="${oneline#*/}"
+    if [[ "$rest" == "$oneline" ]]; then part2=""; else part2="${rest%%/*}"; [[ "$rest" == *"/"* ]] && echo "[WARN] Extra '/' in $base rec#$idx" | tee -a "$LOGFILE"; fi
+    seqA=$(clean_seq "$part1"); seqB=$(clean_seq "$part2")
+    if [[ -z "$seqA" ]]; then echo "[WARN] Binder A empty after cleaning in $base rec#$idx, skip." | tee -a "$LOGFILE"; idx=$((idx+1)); continue; fi
+    outfa="${stub}_$idx.fa"
+    {
+      echo ">METTL1"; echo "$METTL1_SEQ"
+      echo ">BINDER_A"; echo "$seqA"
+      if [[ -n "$seqB" ]]; then echo ">BINDER_B"; echo "$seqB"; fi
+    } > "$outfa"
+    if grep -v "^>" "$outfa" | tr -d ' \t\r\n' | grep -q '[^ACDEFGHIKLMNPQRSTVWY]'; then
+      echo "[ERROR] Illegal character remains in $(basename "$outfa"), removing." | tee -a "$LOGFILE"; rm -f "$outfa"
+    else
+      echo "[INFO] Wrote $(basename "$outfa") with $( [[ -n "$seqB" ]] && echo 2 || echo 1 ) binder chain(s)." >> "$LOGFILE"
+    fi
+    idx=$((idx+1))
+  done
+done
+
+fasta_files=$(find "$OUTDIR/fasta" -type f -name "*.fa" | sort)
+if [[ -z "${fasta_files:-}" ]]; then
+  echo "[ERROR] No FASTA files found in $OUTDIR/fasta." | tee -a "$LOGFILE"
+  echo "[ERROR] No FASTA files found. Exiting." >&2
+  exit 1
+fi
+echo "[INFO] Found $(echo "$fasta_files" | wc -l) FASTA files." >> "$LOGFILE"
+
+# ColabFold flags
+HELP=$($COLABFOLD --help 2>&1 || true)
+MODEL_FLAG=""; MODEL_TYPE=""
+if echo "$HELP" | grep -q -- "--model-type"; then
+  MODEL_FLAG="--model-type"; MODEL_TYPE="alphafold2_multimer_v3"
+elif echo "$HELP" | grep -q -- "--models"; then
+  MODEL_FLAG="--models"; MODEL_TYPE="AlphaFold2_multimer_v3"
+fi
+
+TEMPLATE_OPT=""
+if [[ "$USE_TEMPLATE" == "True" || "$USE_TEMPLATE" == "true" ]]; then
+  if echo "$HELP" | grep -q -- "--templates"; then TEMPLATE_OPT="--templates"; fi
+  if echo "$HELP" | grep -q -- "--custom-template-path"; then TEMPLATE_OPT="$TEMPLATE_OPT --custom-template-path $TEMPLATE_DIR"; fi
+fi
+
+AMBER_FLAG=""
+if echo "$HELP" | grep -q -- "--amber"; then
+  if [[ "$AMBER" == "True" || "$AMBER" == "true" ]]; then AMBER_FLAG="--amber"; fi
+elif echo "$HELP" | grep -q -- "--use-gpu-relax"; then
+  if [[ "$AMBER" == "True" || "$AMBER" == "true" ]]; then AMBER_FLAG="--use-gpu-relax"; fi
+fi
+
+# 优先使用 ColabFold 自带的多 GPU 参数（如果存在）
+COLABFOLD_MULTI_GPU_OPT=""
+if echo "$HELP" | grep -q -- "--num-gpus"; then
+  COLABFOLD_MULTI_GPU_OPT="--num-gpus ${#VALID_GPUS[@]}"
+elif echo "$HELP" | grep -Eq -- "--gpus|--gpu"; then
+  # 某些版本使用 --gpus 或 --gpu，尝试传入设备列表（逗号分隔）
+  COLABFOLD_MULTI_GPU_OPT="--gpus $(IFS=,; echo "${VALID_GPUS[*]}")"
+fi
+
+# 同时设置可见设备，确保 ColabFold 只看到我们筛选过的 GPU
+export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${VALID_GPUS[*]}")"
+echo "[INFO] Expose GPUs to ColabFold: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" | tee -a "$LOGFILE"
+if [ -n "$COLABFOLD_MULTI_GPU_OPT" ]; then
+  echo "[INFO] Using ColabFold multi-GPU option: $COLABFOLD_MULTI_GPU_OPT" | tee -a "$LOGFILE"
+else
+  echo "[INFO] ColabFold multi-GPU option not found; relying on CUDA_VISIBLE_DEVICES visibility." | tee -a "$LOGFILE"
+fi
+
+# 逐个 FASTA 运行（让 ColabFold 自身管理多卡并行）
+for fasta in $fasta_files; do
+  output_subdir="$OUTDIR/predictions/$(basename "$fasta" .fa)"
+  mkdir -p "$output_subdir"
+  cmd=(
+    $COLABFOLD
+    ${MODEL_FLAG:+$MODEL_FLAG} ${MODEL_FLAG:+$MODEL_TYPE}
+    --num-recycle "$NUM_RECYCLES"
+    --num-models "$NUM_MODELS"
+  )
+  # shellcheck disable=SC2206
+  [ -n "$TEMPLATE_OPT" ] && cmd+=($TEMPLATE_OPT)
+  [ -n "$AMBER_FLAG" ] && cmd+=($AMBER_FLAG)
+  [ -n "$COLABFOLD_MULTI_GPU_OPT" ] && cmd+=($COLABFOLD_MULTI_GPU_OPT)
+  cmd+=("$fasta" "$output_subdir")
+
+  echo "[DEBUG] ${cmd[*]}" >> "$LOGFILE"
+
+  set +e
+  "${cmd[@]}" >> "$LOGFILE" 2>&1
+  rc=$?
+  set -e
+  if [ $rc -ne 0 ]; then
+    echo "[ERROR] ColabFold failed for $fasta (rc=$rc)" | tee -a "$LOGFILE"
+  else
+    echo "[OK] Processed $fasta" | tee -a "$LOGFILE"
+  fi
+done
+
+echo "[OK] AF2-Multimer initial predictions → $OUTDIR/predictions. Log: $LOGFILE"

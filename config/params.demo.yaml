@@ -1,0 +1,107 @@
+project:
+  name: mettl1_wdr4_binder_test
+  batch_id: "local_test_001"
+  seed: 42
+  mode: "mini_protein"
+  use_template: true
+  hotspot_count_grid: [8]
+  length_bins:
+    - {min: 60,  max: 80}
+
+paths:
+  data_dir: "./data"
+  work_dir: "./outputs"
+  tmp_root: "./outputs/tmp"
+  reports_dir: "./outputs/reports"
+  targets_dir: "./outputs/targets"
+  rfdiffusion_repo: "./external/RFdiffusion"
+  proteinmpnn: "./external/ProteinMPNN/protein_mpnn_run.py"
+  templates_dir: "/scratch/project/cs_shuaicli/pgz/s2s/nncodes/data/templates"             # 放置仅含 METTL1 链的模板（可先留空目录）
+  mettl1_pdb: "./data/3ckk.pdb"
+  complex_pdb: "./data/8d58.pdb"
+  reference_complex_for_mask: "./data/8d58.pdb"
+  alphafold_ref_pdb: "./data/8d58.pdb"
+
+scale:
+  rfdesigns_per_combo_per_lenbin: 2             # 小值：每个热点组合×长度档 5 个骨架
+  mpnn_num_seq_per_backbone_initial: 2          # 小值：每骨架 2 条序列
+  mpnn_num_seq_per_backbone_refine: 5           # 如后续精筛使用
+  keep_backbone_top_fraction: 0.5               # 测试时尽量多保留
+  max_backbones_refine: 50
+  dedup_rmsd_threshold: 2.0
+
+rfdd:
+  model_only_neighbors: true
+  neighborhood_radius: 11.0
+  inference_T: 50
+  noise_scale: 0.2
+
+af2:
+  with_template:
+    initial:
+      num_models: 4
+      num_recycles: 4
+      amber_relax: true
+    refine:
+      num_models: 3
+      num_recycles: 4
+      amber_relax: false
+  no_template:
+    initial:
+      num_models: 1
+      num_recycles: 1
+      amber_relax: false
+    refine:
+      num_models: 3
+      num_recycles: 4
+      amber_relax: false
+
+filters:
+  initial:
+    iptm_min: 0.50
+    pae_inter_max: 15.0
+    plddt_interface_min: 65.0
+    bsa_min_by_len:
+      lt80: 500
+      lt100: 700
+      ge100: 900
+    clash_p5_min: 1.6
+    clash_median_min: 2.0
+    coverage_min: 0.25
+  refine:
+    iptm_min: 0.55
+    pae_inter_max: 12.0
+    plddt_interface_min: 70.0
+    bsa_min_by_len:
+      lt80: 600
+      lt100: 800
+      ge100: 1000
+    clash_p5_min: 1.8
+    clash_median_min: 2.2
+    coverage_min: 0.35
+
+ranking:
+  weights:
+    iptm: 0.35
+    inv_pae_inter: 0.20
+    bsa: 0.25
+    plddt_interface: 0.10
+    coverage: 0.10
+  norm:
+    bsa_scale: 1500.0
+    pae_scale: 20.0
+
+compute:
+  gpus: [0,1]                        # 单块 2080 Ti
+  slots_per_gpu: 3
+  max_concurrent_rf: 2
+  max_concurrent_mpnn: 2
+  max_concurrent_af2_initial: 2
+  max_concurrent_af2_refine: 2
+  min_free_mem_mb_for_gpu: 9000    # 低于此值回退 CPU
+  cpu_fallback: true
+
+cleanup:
+  keep_af2_top_k_per_target: 1
+  remove_msas_after_stage: true
+  compress_intermediates: false

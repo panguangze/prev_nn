@@ -1,0 +1,113 @@
+# config/params.yaml
+project:
+  name: mwdb
+  batch_id: "batch_001"
+  seed: 42
+  mode: "mini_protein"     
+  use_template: true
+  hotspot_count_grid: [8, 12]
+  length_bins:             
+    - {min: 60,  max: 80}
+    - {min: 80,  max: 100}
+
+paths:
+  data_dir: "./data"
+  work_dir: "./outputs"
+  tmp_root: "./outputs/tmp"
+  reports_dir: "./outputs/reports"
+  targets_dir: "./outputs/targets"
+  rfdiffusion_repo: "./external/RFdiffusion"
+  proteinmpnn: "./external/ProteinMPNN/protein_mpnn_run.py"
+  templates_dir: "./data/templates"      
+  mettl1_pdb: "./data/3ckk.pdb"           
+  complex_pdb: "./data/8d58.pdb"          
+  reference_complex_for_mask: "./data/8d58.pdb" 
+  alphafold_ref_pdb: "./data/8d58.pdb"   
+
+scale:
+  # RFdiffusion骨架1–2万；这里按批次控制，建议多批多次运行凑够量级
+  rfdesigns_per_combo_per_lenbin: 500   # 每个热点组合×长度档 生成的骨架数量
+  mpnn_num_seq_per_backbone_initial: 5  # 初筛：每个骨架序列采样数
+  mpnn_num_seq_per_backbone_refine: 50   # 精筛：对入围骨架追加序列数
+  keep_backbone_top_fraction: 0.2        # 初筛入围比例（骨架级）
+  max_backbones_refine: 3000             # 精筛阶段骨架上限（防止爆量）
+  dedup_rmsd_threshold: 2.0              # 结构去重聚类阈值（Å，CA RMSD 粗筛）
+
+rfdd:
+  model_only_neighbors: true
+  neighborhood_radius: 11.0
+  inference_T: 50
+  noise_scale: 0.2
+
+af2:
+  # 两档参数：initial / refine；默认跑 with_template 路线
+  with_template:
+    initial:
+      num_models: 2
+      num_recycles: 2
+      amber_relax: false
+    refine:
+      num_models: 5
+      num_recycles: 8
+      amber_relax: true
+  no_template:
+    initial:
+      num_models: 2
+      num_recycles: 2
+      amber_relax: false
+    refine:
+      num_models: 5
+      num_recycles: 8
+      amber_relax: true
+
+filters:
+  initial:
+    iptm_min: 0.55
+    pae_inter_max: 12.0
+    plddt_interface_min: 70.0
+    # BSA 分层阈值（Å²）：按长度设下限
+    bsa_min_by_len:
+      lt80: 800
+      lt100: 1000
+      ge100: 1200
+    clash_p5_min: 1.8        # 界面原子最小距离分布的第5百分位下限
+    clash_median_min: 2.2
+    coverage_min: 0.35       # 遮挡率（对WDR4接口的覆盖比例）下限，初筛更宽松
+  refine:
+    iptm_min: 0.60
+    pae_inter_max: 8.0
+    plddt_interface_min: 75.0
+    bsa_min_by_len:
+      lt80: 900
+      lt100: 1100
+      ge100: 1300
+    clash_p5_min: 1.9
+    clash_median_min: 2.3
+    coverage_min: 0.45
+
+ranking:
+  # 排名加权：最后综合排序用
+  weights:
+    iptm: 0.35
+    inv_pae_inter: 0.20
+    bsa: 0.25
+    plddt_interface: 0.10
+    coverage: 0.10
+  # 正则化常量，避免尺度差异
+  norm:
+    bsa_scale: 1500.0
+    pae_scale: 20.0
+
+compute:
+  gpus: [0,1,2,3]
+  max_concurrent_rf: 4
+  max_concurrent_mpnn: 8
+  max_concurrent_af2_initial: 6
+  max_concurrent_af2_refine: 4
+  min_free_mem_mb_for_gpu: 12000
+  cpu_fallback: false
+
+cleanup:
+  keep_af2_top_k_per_target: 2
+  remove_msas_after_stage: true
+  compress_intermediates: true

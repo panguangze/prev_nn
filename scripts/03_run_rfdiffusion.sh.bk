@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PARAMS=$1
+
+RFDIFFUSION_REPO=$(python scripts/get_param_yaml.py "$PARAMS" paths.rfdiffusion_repo)
+WORKDIR=$(python scripts/get_param_yaml.py "$PARAMS" paths.work_dir)
+TARGETS_DIR=$(python scripts/get_param_yaml.py "$PARAMS" paths.targets_dir)
+
+OUTDIR="${WORKDIR}/rfdiffusion_raw"
+TARGET_JSON="${TARGETS_DIR}/interface_candidates.json"
+HOTSETS_JSON="${TARGETS_DIR}/hotspots_sets.json"
+
+mkdir -p "$OUTDIR"
+LOGFILE="$OUTDIR/log.txt"  # 新增：统一日志文件
+: > "$LOGFILE"  # 清空日志
+
+test -s "$TARGET_JSON"
+test -s "$HOTSETS_JSON"
+
+BATCH_ID=$(python scripts/get_param_yaml.py "$PARAMS" project.batch_id)
+DESIGNS_PER_COMBO=$(python scripts/get_param_yaml.py "$PARAMS" scale.rfdesigns_per_combo_per_lenbin)
+NEI_RAD=$(python scripts/get_param_yaml.py "$PARAMS" rfdd.neighborhood_radius)
+MODEL_ONLY=$(python scripts/get_param_yaml.py "$PARAMS" rfdd.model_only_neighbors)
+T=$(python scripts/get_param_yaml.py "$PARAMS" rfdd.inference_T || echo 50)
+NOISE=$(python scripts/get_param_yaml.py "$PARAMS" rfdd.noise_scale || echo 0.2)
+
+METTL1_TARGET_PDB=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["mettl1_target_pdb"])' "$TARGET_JSON")
+TARGET_CHAIN_ID=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["mettl1_chain_id"])' "$TARGET_JSON")
+
+echo "[INFO] target_pdb=$METTL1_TARGET_PDB" | tee -a "$LOGFILE"
+echo "[INFO] target_chain=$TARGET_CHAIN_ID" | tee -a "$LOGFILE"
+test -s "$METTL1_TARGET_PDB"
+
+CONTIG_SEGMENTS=$(python -c 'import sys; from Bio.PDB import PDBParser
+pdb_file, chain_id = sys.argv[1], sys.argv[2]
+p=PDBParser(QUIET=True); s=p.get_structure("p", pdb_file)
+res=[r.id[1] for r in s[0][chain_id] if r.id[0]==" "]
+res.sort()
+segs=[]
+if res:
+    st=res[0]
+    for i in range(1,len(res)):
+        if res[i]!=res[i-1]+1:
+            segs.append(f"{chain_id}{st}-{res[i-1]}")
+            st=res[i]
+    segs.append(f"{chain_id}{st}-{res[-1]}")
+print(" ".join(segs))' "$METTL1_TARGET_PDB" "$TARGET_CHAIN_ID")
+echo "[INFO] contig_segments=$CONTIG_SEGMENTS" | tee -a "$LOGFILE"
+[ -n "$CONTIG_SEGMENTS" ]
+
+readarray -t LENBINS < <(python scripts/get_param_yaml.py "$PARAMS" project.length_bins --json | python -c 'import sys,json; bins=json.load(sys.stdin);
+for b in bins: print("{},{}".format(b["min"], b["max"]))')
+echo "[INFO] lenbins=${LENBINS[*]}" | tee -a "$LOGFILE"
+[ ${#LENBINS[@]} -gt 0 ]
+
+# 并发参数（从 YAML 获取，默认等于 NGPU）
+MAXJ=$(python scripts/get_param_yaml.py "$PARAMS" compute.max_concurrent_rf 2>/dev/null || echo "")
+
+# 读取 GPU 列表（从 YAML 或其他来源）
+mapfile -t GPUS < <(python scripts/get_param_yaml.py "$PARAMS" compute.gpus --json | tr -d '[] ' | tr ',' '\n')
+NGPU=${#GPUS[@]}
+if [ "$NGPU" -eq 0 ]; then
+  echo "[WARN] No GPUs detected; will run without explicit binding." | tee -a "$LOGFILE"
+  MAXJ=1  # 强制 MAXJ=1
+else
+  # 如果 MAXJ 未指定，默认为 NGPU
+  if [ -z "$MAXJ" ]; then
+    MAXJ=$NGPU
+  fi
+  # 自动限制 MAXJ 不超过 NGPU，避免过度共享
+  if [ "$MAXJ" -gt "$NGPU" ]; then
+    old_maxj=$MAXJ
+    MAXJ=$NGPU
+    echo "[WARN] MAXJ ($old_maxj) > NGPU ($NGPU); capping to $MAXJ to avoid GPU oversubscription." | tee -a "$LOGFILE"
+  fi
+fi
+echo "[INFO] Detected $NGPU GPUs. Concurrency limit (MAXJ): $MAXJ" | tee -a "$LOGFILE"
+
+# --- run_one 函数（改为子 shell 以隔离 GPU 设置和输出） ---
+run_one() {
+  local k="$1"
+  local OUTP="$2"
+  local LMIN="$3"
+  local LMAX="$4"
+  local HOTSTR="$5"
+
+  (
+    set -e
+
+    # 分配 GPU（循环使用 GPUS 数组）
+    local GPU_IDX=$((k % NGPU))
+    local GPU_ID="${GPUS[$GPU_IDX]}"
+    export CUDA_VISIBLE_DEVICES="$GPU_ID"
+    echo "[INFO] Running design $k on GPU $GPU_ID" >> "$LOGFILE"
+
+    local len
+    len=$(python -c 'import sys,random; seed,lmin,lmax=map(int,sys.argv[1:]); random.seed(100000+seed); print(random.randint(lmin,lmax))' "$k" "$LMIN" "$LMAX")
+    local pref="$OUTP/design_${k}_len${len}"
+    local CONTIG_STR="[$CONTIG_SEGMENTS/0 ${len}-${len}]"
+
+    set +e
+    python "$RFDIFFUSION_REPO/scripts/run_inference.py" \
+      inference.input_pdb="$METTL1_TARGET_PDB" \
+      inference.output_prefix="$pref" \
+      inference.num_designs=1 \
+      ppi.hotspot_res="[$HOTSTR]" \
+      contigmap.contigs="$CONTIG_STR" \
+      inference.model_only_neighbors="$MODEL_ONLY" \
+      inference.radius="$NEI_RAD" \
+      diffuser.T="$T" \
+      denoiser.noise_scale_ca=1 >> "$LOGFILE" 2>&1
+    rc=$?
+    set -e
+
+    if [ $rc -ne 0 ]; then
+      python "$RFDIFFUSION_REPO/scripts/run_inference.py" \
+        inference.input_pdb="$METTL1_TARGET_PDB" \
+        inference.output_prefix="$pref" \
+        inference.num_designs=1 \
+        ppi.hotspot_res="[$HOTSTR]" \
+        contigmap.contigs="$CONTIG_STR" \
+        inference.model_only_neighbors="$MODEL_ONLY" \
+        inference.radius="$NEI_RAD" \
+        diffuser.T="$T" \
+        denoiser.noise_scale_ca=1 >> "$LOGFILE" 2>&1 || true
+    fi
+  ) >> "$LOGFILE" 2>&1  # 所有输出重定向到日志
+}
+
+export -f run_one
+export RFDIFFUSION_REPO METTL1_TARGET_PDB MODEL_ONLY NEI_RAD T LOGFILE NGPU GPUS
+
+# 外循环（hotsets 和 lenbins）
+python -c 'import json,sys; d=json.load(open(sys.argv[1]));
+[print(i, S["hotspot_res_str"].replace(":",""), S["hotspot_count"]) for i,S in enumerate(d)]' "$HOTSETS_JSON" | while read -r IDX HOTSTR NOS; do
+  for lb in "${LENBINS[@]}"; do
+    LMIN=${lb%,*}; LMAX=${lb#*,}
+    OUTP="$OUTDIR/batch-${BATCH_ID}_set-${IDX}_hs-${NOS}_len-${LMIN}-${LMAX}"
+    mkdir -p "$OUTP"
+
+    # --- 内循环并发逻辑（纯 Bash） ---
+    echo "[INFO] Starting concurrent designs for set $IDX, len $LMIN-$LMAX (DESIGNS_PER_COMBO: $DESIGNS_PER_COMBO)" | tee -a "$LOGFILE"
+
+    if wait -n &>/dev/null; then
+      echo "[INFO] Using efficient 'wait -n' for concurrency." | tee -a "$LOGFILE"
+      for (( k=1; k<=$DESIGNS_PER_COMBO; k++ )); do
+        if [[ $(jobs -p | wc -l) -ge $MAXJ ]]; then
+          wait -n
+        fi
+        echo "[INFO] Launching design $k" >> "$LOGFILE"
+        run_one "$k" "$OUTP" "$LMIN" "$LMAX" "$HOTSTR" &
+      done
+    else
+      echo "[INFO] 'wait -n' not supported. Using improved continuous concurrency simulation." | tee -a "$LOGFILE"
+      k=1
+      while [ $k -le $DESIGNS_PER_COMBO ]; do
+        running_jobs=$(jobs -p | wc -l)
+        if [ $running_jobs -lt $MAXJ ]; then
+          echo "[INFO] Launching design $k (running: $running_jobs/$MAXJ)" >> "$LOGFILE"
+          run_one "$k" "$OUTP" "$LMIN" "$LMAX" "$HOTSTR" &
+          k=$((k + 1))
+        else
+          echo "[DEBUG] Waiting for a slot (running: $running_jobs/$MAXJ)" >> "$LOGFILE"
+          sleep 1
+        fi
+      done
+    fi
+
+    echo "[INFO] All designs launched for set $IDX, len $LMIN-$LMAX. Waiting..." | tee -a "$LOGFILE"
+    wait
+  done
+done
+
+echo "[OK] $OUTDIR" | tee -a "$LOGFILE"

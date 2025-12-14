@@ -1,0 +1,300 @@
+# scripts/05_run_af2_multimer.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------- 环境与通用设置 ----------
+PARAMS="config/params.yaml"
+OUTROOT=$(python scripts/get_param_yaml.py "$PARAMS" paths.work_dir)
+OUTDIR="$OUTROOT/af2_models"
+MPNN_DIR="$OUTROOT/mpnn_seqs"
+TEMPLATE_DIR=$(python scripts/get_param_yaml.py "$PARAMS" paths.templates_dir)
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/predictions" "$TEMPLATE_DIR"
+LOGFILE="$OUTDIR/log.txt"; : > "$LOGFILE"
+
+# 清理已知不兼容的 XLA flags，避免直接崩溃
+if [[ -n "${XLA_FLAGS:-}" ]]; then
+  CLEANED="$(echo "$XLA_FLAGS" | sed 's/--xla_gpu_enable_triton=false//g' | tr -s ' ')"
+  if [[ "$CLEANED" != "$XLA_FLAGS" ]]; then
+    echo "[WARN] Removing unsupported XLA flag: --xla_gpu_enable_triton=false" | tee -a "$LOGFILE"
+    export XLA_FLAGS="$CLEANED"
+  fi
+fi
+# 显存友好设置：不一次性抢占全部显存
+export XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-platform}"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.80}"
+
+# 从参数读取设置
+USE_TEMPLATE=$(python scripts/get_param_yaml.py "$PARAMS" project.use_template)
+NUM_MODELS=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_models)
+NUM_RECYCLES=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_recycles)
+AMBER=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.amber_relax)
+MINFREE=$(python scripts/get_param_yaml.py "$PARAMS" compute.min_free_mem_mb_for_gpu)
+
+# 检测 colabfold 入口
+if command -v colabfold_batch >/dev/null 2>&1; then
+  COLABFOLD="colabfold_batch"
+else
+  COLABFOLD="python -m colabfold.batch"
+fi
+
+# 记录版本信息
+{
+  echo "[INFO] $(date) Starting AF2-Multimer"
+  echo "[INFO] ColabFold entry: $COLABFOLD"
+  $COLABFOLD --version 2>/dev/null || true
+  python - <<'PY'
+try:
+    import jax, jaxlib
+    print(f"[INFO] jax={jax.__version__} jaxlib={jaxlib.__version__}")
+except Exception as e:
+    print("[WARN] Failed to import jax/jaxlib:", e)
+PY
+} >> "$LOGFILE" 2>&1
+
+# GPU 可用性与内存
+GPU_MEM_FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1 2>/dev/null || echo "0")
+GPU_OPT=""
+if [[ "$GPU_MEM_FREE" =~ ^[0-9]+$ ]] && [ "$GPU_MEM_FREE" -ge "$MINFREE" ]; then
+  echo "[INFO] GPU free mem: ${GPU_MEM_FREE} MiB (>= ${MINFREE})" | tee -a "$LOGFILE"
+else
+  GPU_OPT="--use-cpu"
+  echo "[WARN] Low or unknown GPU memory (${GPU_MEM_FREE} MiB), using CPU." | tee -a "$LOGFILE"
+fi
+
+# ---------- 提取 METTL1 序列 ----------
+python - <<'PY'
+import json, sys
+from Bio.PDB import PDBParser, PPBuilder
+cand = json.load(open("./outputs/targets/interface_candidates.json"))
+pdb = cand["mettl1_target_pdb"]; chain_id = cand["mettl1_chain_id"]
+ppb = PPBuilder()
+s = PDBParser(QUIET=True).get_structure("T", pdb)
+seq = ""
+for pp in ppb.build_peptides(s[0][chain_id]):
+    seq += str(pp.get_sequence())
+out = "./outputs/targets/mettl1_seq.fa"
+with open(out,"w") as f:
+    f.write(">METTL1\n"+seq+"\n")
+print(f"[OK] METTL1 seq written to {out}")
+PY
+
+# 读取 METTL1 序列并清洗
+clean_seq() {
+  local raw="${1:-}"
+  raw="$(echo "${raw:-}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')"
+  echo "$raw" | sed 's/[^ACDEFGHIKLMNPQRSTVWY]//g'
+}
+METTL1_SEQ_RAW=$(grep -v "^>" ./outputs/targets/mettl1_seq.fa | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]' || true)
+METTL1_SEQ=$(clean_seq "${METTL1_SEQ_RAW:-}")
+if [[ -z "${METTL1_SEQ:-}" ]]; then
+  echo "[ERROR] Empty METTL1 sequence after cleaning." | tee -a "$LOGFILE"
+  exit 1
+fi
+
+# ---------- 组装 FASTA（修复 “/” 多链） ----------
+# 对每个 MPNN 的 .fa：逐条记录合并为一行；按第一个“/”拆分为最多两条 binder 链
+find "$MPNN_DIR" -type f -name "*.fa" | sort | while read -r seqfile; do
+  if [[ -z "${seqfile:-}" ]] || [[ ! -s "$seqfile" ]]; then
+    echo "[WARN] Empty or missing seqfile: $seqfile" | tee -a "$LOGFILE"
+    continue
+  fi
+
+  base="$(basename "${seqfile%.*}")"
+  stub="$OUTDIR/fasta/$base"
+  mkdir -p "$OUTDIR/fasta"
+
+  idx=1
+  # 把 FASTA 规范化为“标题行 + 单行序列”对
+  awk '
+    BEGIN{RS=">"; FS="\n"}
+    NR>1{
+      hdr=$1; seq="";
+      for(i=2;i<=NF;i++) seq=seq $i;
+      gsub(/\r/,"",seq); gsub(/[ \t\n]/,"",seq);
+      if (seq!="") {print hdr; print seq;}
+    }' "$seqfile" | \
+  while read -r header && read -r oneline; do
+    # 如果 oneline 未定义或为空，跳过
+    if [[ -z "${oneline:-}" ]]; then
+      echo "[WARN] Empty sequence line in $base record#$idx, skip." | tee -a "$LOGFILE"
+      idx=$((idx+1)); continue
+    fi
+
+    # 按第一个 “/” 拆分
+    part1="${oneline%%/*}"
+    rest="${oneline#*/}"
+    if [[ "$rest" == "$oneline" ]]; then
+      part2=""
+    else
+      part2="${rest%%/*}"
+      [[ "$rest" == *"/"* ]] && echo "[WARN] Extra '/' in $base record#$idx, only first split used." | tee -a "$LOGFILE"
+    fi
+
+    seqA=$(clean_seq "$part1")
+    seqB=$(clean_seq "$part2")
+
+    if [[ -z "$seqA" ]]; then
+      echo "[WARN] Binder A empty after cleaning in $base record#$idx, skip." | tee -a "$LOGFILE"
+      idx=$((idx+1)); continue
+    fi
+
+    outfa="${stub}_$idx.fa"
+    {
+      echo ">METTL1"
+      echo "$METTL1_SEQ"
+      echo ">BINDER_A"
+      echo "$seqA"
+      if [[ -n "$seqB" ]]; then
+        echo ">BINDER_B"
+        echo "$seqB"
+      fi
+    } > "$outfa"
+
+    # 校验是否仍有非法字符
+    if grep -v "^>" "$outfa" | tr -d ' \t\r\n' | grep -q '[^ACDEFGHIKLMNPQRSTVWY]'; then
+      echo "[ERROR] Illegal character remains in $(basename "$outfa"), removing." | tee -a "$LOGFILE"
+      rm -f "$outfa"
+    else
+      echo "[INFO] Wrote $(basename "$outfa") with $( [[ -n "$seqB" ]] && echo 2 || echo 1 ) binder chain(s)." >> "$LOGFILE"
+    fi
+
+    idx=$((idx+1))
+  done
+done
+
+fasta_files=$(find "$OUTDIR/fasta" -type f -name "*.fa" | sort || true)
+if [[ -z "${fasta_files:-}" ]]; then
+  echo "[ERROR] No FASTA files found in $OUTDIR/fasta. Check MPNN outputs and parsing." | tee -a "$LOGFILE"
+  exit 1
+fi
+echo "[INFO] Found $(echo "$fasta_files" | wc -l) complex FASTA files." | tee -a "$LOGFILE"
+
+# ---------- 解析 colabfold 可用参数 ----------
+HELP=$($COLABFOLD --help 2>&1 || true)
+MODEL_FLAG=""
+MODEL_TYPE="alphafold2_multimer_v3"
+if echo "$HELP" | grep -q -- "--model-type"; then
+  MODEL_FLAG="--model-type"
+elif echo "$HELP" | grep -q -- "--models"; then
+  MODEL_FLAG="--models"
+  MODEL_TYPE="AlphaFold2_multimer_v3"
+fi
+
+# 模板参数（首次尝试按配置）
+TEMPLATE_OPT=""
+if [[ "${USE_TEMPLATE,,}" == "true" ]]; then
+  if echo "$HELP" | grep -q -- "--templates"; then
+    TEMPLATE_OPT="--templates"
+  fi
+  if echo "$HELP" | grep -q -- "--custom-template-path"; then
+    TEMPLATE_OPT="$TEMPLATE_OPT --custom-template-path $TEMPLATE_DIR"
+  fi
+fi
+
+# AMBER/Relax 参数
+AMBER_FLAG=""
+if echo "$HELP" | grep -q -- "--amber"; then
+  [[ "${AMBER,,}" == "true" ]] && AMBER_FLAG="--amber"
+elif echo "$HELP" | grep -q -- "--use-gpu-relax"; then
+  [[ "${AMBER,,}" == "true" ]] && AMBER_FLAG="--use-gpu-relax"
+fi
+
+# 低内存策略开关探测
+MSA_SINGLE_OPT=""; PAIR_UNPAIRED_OPT=""
+if echo "$HELP" | grep -q -- "--msa-mode"; then
+  MSA_SINGLE_OPT="--msa-mode single_sequence"
+fi
+if echo "$HELP" | grep -q -- "--pair-mode"; then
+  PAIR_UNPAIRED_OPT="--pair-mode unpaired"
+fi
+
+echo "[INFO] Base flags: ${MODEL_FLAG:+$MODEL_FLAG $MODEL_TYPE} --num-recycle $NUM_RECYCLES --num-models $NUM_MODELS $TEMPLATE_OPT ${AMBER_FLAG:+$AMBER_FLAG} $GPU_OPT" | tee -a "$LOGFILE"
+
+# ---------- 并发 ----------
+MAXJ=$(python scripts/get_param_yaml.py "$PARAMS" compute.max_concurrent_af2_initial)
+if ! command -v sem >/dev/null 2>&1; then
+  echo "[WARN] 'sem' not found; running sequentially." | tee -a "$LOGFILE"
+  MAXJ=1
+fi
+
+# ---------- 运行函数，带降配重试 ----------
+run_with_retries() {
+  local fasta="$1"
+  local outdir="$2"
+  local num_models="$3"
+  local num_recycles="$4"
+  local template_opt="$5"
+  local gpu_opt="$6"
+  local extra_opt="${7:-}"  # 低内存策略，如 --msa-mode single_sequence --pair-mode unpaired
+
+  mkdir -p "$outdir"
+
+  # 尝试 1：用户/配置要求
+  local cmd1=("$COLABFOLD")
+  [[ -n "$MODEL_FLAG" ]] && cmd1+=("$MODEL_FLAG" "$MODEL_TYPE")
+  cmd1+=("--num-models" "$num_models" "--num-recycle" "$num_recycles")
+  [[ -n "$template_opt" ]] && cmd1+=($template_opt)
+  [[ -n "$AMBER_FLAG" ]] && cmd1+=("$AMBER_FLAG")
+  [[ -n "$gpu_opt" ]] && cmd1+=("$gpu_opt")
+  [[ -n "${extra_opt:-}" ]] && cmd1+=($extra_opt)
+  cmd1+=("$fasta" "$outdir")
+
+  echo "[DEBUG] TRY1: ${cmd1[*]}" | tee -a "$LOGFILE"
+  if "${cmd1[@]}" >>"$LOGFILE" 2>&1; then
+    echo "[OK] Success TRY1 for $(basename "$fasta")" | tee -a "$LOGFILE"
+    return 0
+  fi
+  echo "[WARN] TRY1 failed: $(basename "$fasta"), will downgrade." | tee -a "$LOGFILE"
+
+  # 尝试 2：去模板 + 低内存 MSA 配置 + 降 recycle
+  local cmd2=("$COLABFOLD")
+  [[ -n "$MODEL_FLAG" ]] && cmd2+=("$MODEL_FLAG" "$MODEL_TYPE")
+  cmd2+=("--num-models" "1" "--num-recycle" "0")
+  [[ -n "$AMBER_FLAG" ]] && cmd2+=("$AMBER_FLAG")
+  [[ -z "$gpu_opt" ]] || cmd2+=("$gpu_opt")  # 如果有 --use-cpu 就保留
+  [[ -n "$MSA_SINGLE_OPT" ]] && cmd2+=($MSA_SINGLE_OPT)
+  [[ -n "$PAIR_UNPAIRED_OPT" ]] && cmd2+=($PAIR_UNPAIRED_OPT)
+  cmd2+=("$fasta" "$outdir")
+
+  echo "[DEBUG] TRY2 (OOM-safe): ${cmd2[*]}" | tee -a "$LOGFILE"
+  if "${cmd2[@]}" >>"$LOGFILE" 2>&1; then
+    echo "[OK] Success TRY2 for $(basename "$fasta")" | tee -a "$LOGFILE"
+    return 0
+  fi
+  echo "[WARN] TRY2 failed: $(basename "$fasta"), will CPU fallback." | tee -a "$LOGFILE"
+
+  # 尝试 3：CPU 兜底（最慢，但应不 OOM）
+  local cmd3=("$COLABFOLD")
+  [[ -n "$MODEL_FLAG" ]] && cmd3+=("$MODEL_FLAG" "$MODEL_TYPE")
+  cmd3+=("--num-models" "1" "--num-recycle" "0" "--use-cpu")
+  [[ -n "$MSA_SINGLE_OPT" ]] && cmd3+=($MSA_SINGLE_OPT)
+  [[ -n "$PAIR_UNPAIRED_OPT" ]] && cmd3+=($PAIR_UNPAIRED_OPT)
+  cmd3+=("$fasta" "$outdir")
+
+  echo "[DEBUG] TRY3 (CPU): ${cmd3[*]}" | tee -a "$LOGFILE"
+  if "${cmd3[@]}" >>"$LOGFILE" 2>&1; then
+    echo "[OK] Success TRY3 (CPU) for $(basename "$fasta")" | tee -a "$LOGFILE"
+    return 0
+  fi
+
+  echo "[ERROR] All retries failed for $(basename "$fasta"). See $LOGFILE." | tee -a "$LOGFILE"
+  return 1
+}
+
+# ---------- 遍历并运行 ----------
+# 将变量展开为数组，避免 glob/空值问题
+mapfile -t FASTA_LIST < <(find "$OUTDIR/fasta" -type f -name "*.fa" | sort)
+for fasta in "${FASTA_LIST[@]}"; do
+  output_subdir="$OUTDIR/predictions/$(basename "$fasta" .fa)"
+  mkdir -p "$output_subdir"
+
+  INIT_EXTRA_OPT=""  # 可扩展
+  if [ "$MAXJ" -gt 1 ]; then
+    sem -j "$MAXJ" --id af2i --eval "run_with_retries \"$fasta\" \"$output_subdir\" \"$NUM_MODELS\" \"$NUM_RECYCLES\" \"$TEMPLATE_OPT\" \"$GPU_OPT\" \"$INIT_EXTRA_OPT\""
+  else
+    run_with_retries "$fasta" "$output_subdir" "$NUM_MODELS" "$NUM_RECYCLES" "$TEMPLATE_OPT" "$GPU_OPT" "$INIT_EXTRA_OPT"
+  fi
+done
+
+if [ "$MAXJ" -gt 1 ]; then sem --id af2i --wait; fi
+echo "[OK] AF2-Multimer predictions → $OUTDIR/predictions. Log: $LOGFILE"

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- 参数和路径设置 (无变化) ---
+if [[ -n "${XLA_FLAGS:-}" ]]; then
+  export XLA_FLAGS="$(echo "$XLA_FLAGS" | sed 's/--xla_gpu_enable_triton=false//g' | tr -s ' ')"
+fi
+PARAMS=$1
+OUTROOT=$(python scripts/get_param_yaml.py "$PARAMS" paths.work_dir)
+OUTDIR="$OUTROOT/af2_models"
+MPNN_DIR="$OUTROOT/mpnn_seqs"
+TEMPLATE_DIR=$(python scripts/get_param_yaml.py "$PARAMS" paths.templates_dir)
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/predictions"
+LOGFILE="$OUTDIR/log.txt"; : > "$LOGFILE"
+
+USE_TEMPLATE=$(python scripts/get_param_yaml.py "$PARAMS" project.use_template)
+NUM_MODELS=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_models)
+NUM_RECYCLES=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.num_recycles)
+AMBER=$(python scripts/get_param_yaml.py "$PARAMS" af2.with_template.initial.amber_relax)
+
+# --- ColabFold 和 GPU 检测 (无变化) ---
+if command -v colabfold_batch >/dev/null 2>&1; then
+  COLABFOLD="colabfold_batch"
+else
+  COLABFOLD="python -m colabfold.batch"
+fi
+discover_gpus() {
+  local cfg; local arr=()
+  cfg=$(python scripts/get_param_yaml.py "$PARAMS" compute.gpus --json 2>/dev/null || echo "")
+  if [[ -n "$cfg" && "$cfg" != "null" ]]; then
+    cfg=$(echo "$cfg" | tr -d '[]"' | tr ',' ' ')
+    read -r -a arr <<< "$cfg"
+  elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a arr <<< "$CUDA_VISIBLE_DEVICES"
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    mapfile -t arr < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+  fi
+  printf '%s\n' "${arr[@]}"
+}
+mapfile -t GPUS < <(discover_gpus)
+MINFREE=$(python scripts/get_param_yaml.py "$PARAMS" compute.min_free_mem_mb_for_gpu)
+VALID_GPUS=()
+for g in "${GPUS[@]:-}"; do
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id="$g" 2>/dev/null || echo "0")
+  if [[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge "$MINFREE" ]; then
+    echo "[INFO] GPU $g free mem: $free MiB" >> "$LOGFILE"
+    VALID_GPUS+=("$g")
+  else
+    echo "[WARN] GPU $g low or unknown free mem ($free MiB), skipped" >> "$LOGFILE"
+  fi
+done
+#if [ "${#VALID_GPUS[@]}" -eq 0 ]; then
+#  echo "[ERROR] No sufficient GPU memory available." | tee -a "$LOGFILE"; exit 1
+#fi
+NUM_GPUS=${#VALID_GPUS[@]}
+echo "[INFO] Found $NUM_GPUS usable GPUs: ${VALID_GPUS[*]}" | tee -a "$LOGFILE"
+
+# --- METTL1 序列准备 (无变化) ---
+if [ ! -f "./outputs/targets/mettl1_seq.fa" ]; then
+    echo "[INFO] METTL1 sequence file not found. Generating..." >> "$LOGFILE"
+    python - <<'PY'
+import json, sys
+from Bio.PDB import PDBParser, Polypeptide
+from Bio.SeqUtils import seq1
+
+cand_file = "./outputs/targets/interface_candidates.json"
+try:
+    with open(cand_file) as f:
+        cand = json.load(f)
+except FileNotFoundError:
+    sys.stderr.write(f"[ERROR] Cannot find candidate file: {cand_file}\n"); sys.exit(1)
+
+pdb = cand["mettl1_target_pdb"]
+chain_id = cand["mettl1_chain_id"]
+
+parser = PDBParser(QUIET=True)
+structure = parser.get_structure("T", pdb)
+
+# Optional: map common nonstandard residues
+custom_map = {
+    "MSE": "M",   # selenomethionine -> methionine
+    "SEC": "U",   # selenocysteine
+    "PYL": "O",   # pyrrolysine
+}
+
+seq_chars = []
+for r in structure[0][chain_id]:
+    # keep only amino-acid residues; skip waters/ligands
+    if not Polypeptide.is_aa(r, standard=False):
+        continue
+    resname = r.get_resname().strip()
+    try:
+        seq_chars.append(seq1(resname, custom_map=custom_map))
+    except KeyError:
+        # Fallback: treat unknowns as X
+        seq_chars.append("X")
+
+seq = "".join(seq_chars)
+
+out_path = "./outputs/targets/mettl1_seq.fa"
+with open(out_path, "w") as f:
+    f.write(">METTL1\n" + seq + "\n")
+
+print("[OK] METTL1 seq written.")
+PY
+else
+    echo "[INFO] Found existing METTL1 sequence file." >> "$LOGFILE"
+fi
+METTL1_SEQ=$(grep -v "^>" ./outputs/targets/mettl1_seq.fa | tr -d '[:space:]' || true)
+if [[ -z "${METTL1_SEQ:-}" ]]; then
+  echo "[ERROR] Empty METTL1 sequence after cleaning." | tee -a "$LOGFILE"; exit 1
+fi
+
+# ==============================================================================
+#           模板数据库预处理 (解决竞争条件)
+# ==============================================================================
+#if [[ "$USE_TEMPLATE" == "True" || "$USE_TEMPLATE" == "true" ]]; then
+#  echo "[INFO] Pre-generating template database to prevent race conditions..." | tee -a "$LOGFILE"
+#  DUMMY_FASTA="$OUTDIR/dummy_for_template_init.fa"
+#  DUMMY_OUT="$OUTDIR/dummy_for_template_init_out"
+#  echo -e ">dummy\nG" > "$DUMMY_FASTA"
+#  
+#  # 运行一个快速的、无意义的命令，其唯一目的是触发 mk_hhsearch_db
+#  # 这会为共享的模板目录创建一次索引，供所有后续并行作业使用
+#  $COLABFOLD \
+#    --templates --custom-template-path "$TEMPLATE_DIR" \
+#    --msa-mode "single_sequence" \
+#    "$DUMMY_FASTA" \
+#    "$DUMMY_OUT" >> "$LOGFILE" 2>&1
+#
+#  # 清理临时文件
+#  rm -rf "$DUMMY_FASTA" "$DUMMY_OUT"
+#  echo "[OK] Template database is ready for parallel use." | tee -a "$LOGFILE"
+#fi
+
+
+# --- FASTA组装逻辑 (无变化) ---
+echo "[INFO] Assembling all FASTA files into UNIQUE COMPLEX format..." | tee -a "$LOGFILE"
+rm -rf "$OUTDIR/fasta"
+mkdir -p "$OUTDIR/fasta"
+find "$MPNN_DIR" -type f -path "*/seqs/*.fa" | sort | while read -r mpnn_multiseq_fa; do
+  [[ ! -s "$mpnn_multiseq_fa" ]] && continue
+  design_backbone_name=$(basename "${mpnn_multiseq_fa%.fa}")
+  awk -v mettl1_seq="$METTL1_SEQ" -v out_dir="$OUTDIR/fasta" -v backbone_name="$design_backbone_name" \
+      'BEGIN{RS=">";FS="\n"}NR>1{header=$1;sequence="";for(i=2;i<=NF;i++){sequence=sequence $i}gsub(/[ \t\r\n]/,"",sequence);if(sequence=="")next;if(match(header,/sample=([^, ]+)/,arr)){sample_id=arr[1]}else{sample_id="0"}out_file=out_dir"/"backbone_name"_sample_"sample_id".fa";print ">METTL1:"backbone_name"_sample_"sample_id > out_file;print mettl1_seq":"sequence >> out_file;close(out_file)}' "$mpnn_multiseq_fa"
+done
+
+
+# --- 任务分割逻辑 (无变化) ---
+mapfile -t ALL_FASTAS < <(find "$OUTDIR/fasta" -type f -name "*.fa" | sort)
+NUM_FILES=${#ALL_FASTAS[@]}
+if [[ "$NUM_FILES" -eq 0 ]]; then
+  echo "[ERROR] No FASTA files were assembled. Cannot proceed." | tee -a "$LOGFILE"; exit 1
+fi
+echo "[INFO] Successfully assembled $NUM_FILES FASTA files. Now splitting for parallel execution." | tee -a "$LOGFILE"
+SPLIT_DIR="$OUTDIR/fasta_split_for_gpus"; rm -rf "$SPLIT_DIR"; mkdir -p "$SPLIT_DIR"
+for (( i=0; i<NUM_GPUS; i++ )); do mkdir -p "$SPLIT_DIR/gpu_$i"; done
+echo "[INFO] Distributing $NUM_FILES files into $NUM_GPUS directories using ABSOLUTE paths..." | tee -a "$LOGFILE"
+for i in "${!ALL_FASTAS[@]}"; do
+  absolute_path="$(readlink -f "${ALL_FASTAS[$i]}")"
+  gpu_index=$(( i % NUM_GPUS ))
+  ln -s "$absolute_path" "$SPLIT_DIR/gpu_$gpu_index/"
+done
+
+
+# --- 并行化逻辑 (无变化) ---
+echo "[INFO] Launching $NUM_GPUS parallel ColabFold jobs..." | tee -a "$LOGFILE"
+
+HELP=$($COLABFOLD --help 2>&1 || true)
+MODEL_FLAG=""; MODEL_TYPE=""
+if echo "$HELP" | grep -q -- "--model-type"; then
+  MODEL_FLAG="--model-type"; MODEL_TYPE="alphafold2_multimer_v3"
+elif echo "$HELP" | grep -q -- "--models"; then
+  MODEL_FLAG="--models"; MODEL_TYPE="AlphaFold2-multimer-v3"
+fi
+
+TEMPLATE_OPT=""
+if [[ "$USE_TEMPLATE" == "True" || "$USE_TEMPLATE" == "true" ]]; then
+  TEMPLATE_OPT="--templates --custom-template-path $TEMPLATE_DIR"
+fi
+
+AMBER_FLAG=""
+if [[ "$AMBER" == "True" || "$AMBER" == "true" ]]; then
+  if echo "$HELP" | grep -q -- "--amber"; then AMBER_FLAG="--amber"; fi
+  if echo "$HELP" | grep -q -- "--use-gpu-relax"; then AMBER_FLAG="--use-gpu-relax"; fi
+fi
+
+for i in "${!VALID_GPUS[@]}"; do
+  GPU_ID=${VALID_GPUS[$i]}
+  INPUT_DIR="$SPLIT_DIR/gpu_$i"
+  OUTPUT_DIR="$OUTDIR/predictions/gpu_$i"
+  mkdir -p "$OUTPUT_DIR"
+
+  if [ -z "$(ls -A "$INPUT_DIR")" ]; then
+    echo "[INFO] GPU $GPU_ID has no files to process, skipping." | tee -a "$LOGFILE"; continue
+  fi
+
+  echo "==================== [GPU $GPU_ID] LAUNCHING JOB ====================" | tee -a "$LOGFILE"
+  (
+    set -x
+    export CUDA_VISIBLE_DEVICES=$GPU_ID
+    # shellcheck disable=SC2206
+    cmd=(
+      $COLABFOLD
+      ${MODEL_FLAG:+$MODEL_FLAG} ${MODEL_FLAG:+$MODEL_TYPE}
+      --num-recycle "$NUM_RECYCLES"
+      --num-models "$NUM_MODELS"
+      $TEMPLATE_OPT
+      $AMBER_FLAG
+      --overwrite-existing-results --msa-mode single_sequence --use-gpu-relax --num-relax 1 --num-models 5 --num-seeds 4 --num-recycle 5 
+      "$INPUT_DIR"
+      "$OUTPUT_DIR"
+    )
+    echo $cmd
+    "${cmd[@]}" >> "$LOGFILE" 2>&1
+    set +x
+    echo "[OK][GPU $GPU_ID] Job finished." >> "$LOGFILE"
+  ) &
+done
+
+echo "[INFO] All jobs launched. Waiting for completion... (tail -f $LOGFILE to monitor)" | tee -a "$LOGFILE"
+wait
+echo "[SUCCESS] All parallel ColabFold jobs have completed. Predictions are in $OUTDIR/predictions/" | tee -a "$LOGFILE"

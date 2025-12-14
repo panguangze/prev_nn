@@ -1,0 +1,117 @@
+# config/params.yaml (DEBUG VERSION - for fast end-to-end pipeline testing)
+project:
+  name: mwdb_debug # [DEBUG] 使用不同的项目名，避免覆盖正式结果
+  batch_id: "batch_debug_001"
+  seed: 42
+  mode: "mini_protein"
+  use_template: true
+  hotspot_count_grid: [8] # [DEBUG] 只测试一种热点数量
+  length_bins:
+    - {min: 60,  max: 60} # [DEBUG] 只测试一个固定长度，避免随机性
+
+paths:
+  # 路径保持不变
+  data_dir: "./data"
+  work_dir: "./outputs_demo"
+  tmp_root: "./outputs_demo/tmp"
+  reports_dir: "./outputs_demo/reports"
+  targets_dir: "./outputs_demo/targets"
+  rfdiffusion_repo: "./external/RFdiffusion"
+  proteinmpnn: "./external/ProteinMPNN/protein_mpnn_run.py"
+  templates_dir: "./data/templates"
+  mettl1_pdb: "./data/3ckk.pdb"
+  complex_pdb: "./data/8d58.pdb"
+  reference_complex_for_mask: "./data/8d58.pdb"
+  alphafold_ref_pdb: "./data/8d58.pdb"
+
+scale:
+  # [DEBUG] 将所有规模参数降至最低
+  rfdesigns_per_combo_per_lenbin: 20
+  mpnn_num_seq_per_backbone_initial: 5
+  mpnn_num_seq_per_backbone_refine: 2
+  keep_backbone_top_fraction: 1.0 # [DEBUG] 确保所有初筛结果都进入精筛
+  max_backbones_refine: 10
+  dedup_rmsd_threshold: 2.0
+
+rfdd:
+  # RFdiffusion参数保持不变
+  model_only_neighbors: true
+  neighborhood_radius: 11.0
+  inference_T: 50
+  noise_scale: 0.2
+
+af2:
+  # [DEBUG] 大幅降低AF2计算量，关闭弛豫
+  with_template:
+    initial:
+      num_models: 2
+      num_recycles: 3
+      amber_relax: false
+    refine:
+      num_models: 1
+      num_recycles: 1
+      amber_relax: false # [DEBUG] 精筛也关闭弛豫以追求速度
+  no_template:
+    initial:
+      num_models: 1
+      num_recycles: 1
+      amber_relax: false
+    refine:
+      num_models: 1
+      num_recycles: 1
+      amber_relax: false
+
+filters:
+  # [DEBUG] 将所有过滤器阈值设为极度宽松，确保有设计能通过
+  initial:
+    iptm_min: 0.01
+    pae_inter_max: 50.0
+    plddt_interface_min: 10.0
+    bsa_min_by_len:
+      lt80: 10
+      lt100: 10
+      ge100: 10
+    clash_p5_min: 0.1
+    clash_median_min: 0.1
+    coverage_min: 0.01
+  refine:
+    iptm_min: 0.01
+    pae_inter_max: 50.0
+    plddt_interface_min: 10.0
+    bsa_min_by_len:
+      lt80: 10
+      lt100: 10
+      ge100: 10
+    clash_p5_min: 0.1
+    clash_median_min: 0.1
+    coverage_min: 0.01
+
+ranking:
+  # 排名权重保持不变
+  weights:
+    iptm: 0.35
+    inv_pae_inter: 0.20
+    bsa: 0.25
+    plddt_interface: 0.10
+    coverage: 0.10
+  norm:
+    bsa_scale: 1500.0
+    pae_scale: 20.0
+
+compute:
+  # [DEBUG] 假设在单GPU上运行，并将并发数设为1，方便排查日志
+  gpus: [0,1,2,3]
+  halt_on_fail: false
+  workers_per_gpu: 20 # <--- 从 2 开始！
+  max_concurrent_rf: 10
+  max_concurrent_mpnn: 10
+  max_concurrent_af2_initial: 1
+  max_concurrent_af2_refine: 1
+  min_free_mem_mb_for_gpu: 12000
+  cpu_fallback: false
+
+cleanup:
+  # 清理设置保持不变
+  keep_af2_top_k_per_target: 2
+  remove_msas_after_stage: true
+  compress_intermediates: true

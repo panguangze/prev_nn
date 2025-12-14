@@ -1,0 +1,146 @@
+# scripts/05_run_af2_multimer.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 环境/标志
+if [[ -n "${XLA_FLAGS:-}" ]]; then
+	export XLA_FLAGS="$(echo "$XLA_FLAGS" | sed 's/--xla_gpu_enable_triton=false//g' | tr -s ' ')"
+fi
+PARAMS="config/params.yaml"
+OUTROOT=$(python scripts/get_param_yaml.py $PARAMS paths.work_dir)
+OUTDIR="$OUTROOT/af2_models"
+MPNN_DIR="$OUTROOT/mpnn_seqs"
+TEMPLATE_DIR=$(python scripts/get_param_yaml.py $PARAMS paths.templates_dir)
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/predictions" "$TEMPLATE_DIR"
+LOGFILE="$OUTDIR/log.txt"; echo "" > "$LOGFILE"
+
+USE_TEMPLATE=$(python scripts/get_param_yaml.py $PARAMS project.use_template)
+NUM_MODELS=$(python scripts/get_param_yaml.py $PARAMS af2.with_template.initial.num_models)
+NUM_RECYCLES=$(python scripts/get_param_yaml.py $PARAMS af2.with_template.initial.num_recycles)
+AMBER=$(python scripts/get_param_yaml.py $PARAMS af2.with_template.initial.amber_relax)
+
+# Detect colabfold
+if command -v colabfold_batch >/dev/null 2>&1; then
+  COLABFOLD="colabfold_batch"
+else
+  COLABFOLD="python -m colabfold.batch"
+fi
+
+GPU_MEM_FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1 || echo "0")
+GPU_OPT=""
+MINFREE=$(python scripts/get_param_yaml.py $PARAMS compute.min_free_mem_mb_for_gpu)
+if [ "$GPU_MEM_FREE" -lt "$MINFREE" ]; then
+  GPU_OPT="--use-cpu"
+  echo "[WARN] Low GPU memory ($GPU_MEM_FREE MiB), falling back to CPU." >> "$LOGFILE"
+else
+  echo "[INFO] GPU free mem: $GPU_MEM_FREE MiB." >> "$LOGFILE"
+fi
+
+# 准备METTL1序列
+python - <<'PY'
+import json
+from Bio.PDB import PDBParser, PPBuilder
+cand = json.load(open("./outputs/targets/interface_candidates.json"))
+pdb = cand["mettl1_target_pdb"]; chain_id = cand["mettl1_chain_id"]
+ppb=PPBuilder()
+s=PDBParser(QUIET=True).get_structure("T", pdb)
+seq=""
+for pp in ppb.build_peptides(s[0][chain_id]):
+    seq += str(pp.get_sequence())
+open("./outputs/targets/mettl1_seq.fa","w").write(">METTL1\n"+seq+"\n")
+print("[OK] METTL1 seq written.")
+PY
+
+# 组装FASTAs
+find "$MPNN_DIR" -type f -name "*.fa" | while read -r seqfile; do
+  binder_seqs=$(grep -v "^>" "$seqfile" | tr -d " \n\r")
+  mettl1_seq=$(grep -v "^>" ./outputs/targets/mettl1_seq.fa | tr -d " \n\r")
+  stub="$OUTDIR/fasta/$(basename "${seqfile%.*}")"
+  i=1
+  for bs in $binder_seqs; do
+    {
+      echo ">METTL1"
+      echo "$mettl1_seq"
+      echo ">BINDER_$i"
+      echo "$bs"
+    } > "${stub}_$i.fa"
+    i=$((i+1))
+  done
+done
+
+fasta_files=$(find "$OUTDIR/fasta" -name "*.fa")
+if [ -z "$fasta_files" ]; then
+  echo "[ERROR] No FASTA files found in $OUTDIR/fasta." >> "$LOGFILE"
+  echo "[ERROR] No FASTA files found. Exiting." >&2
+  exit 1
+fi
+echo "[INFO] Found $(echo "$fasta_files" | wc -l) FASTA files." >> "$LOGFILE"
+
+# Detect flags
+HELP=$($COLABFOLD --help 2>&1 || true)
+MODEL_FLAG=""
+MODEL_TYPE=""
+if echo "$HELP" | grep -q -- "--model-type"; then
+  MODEL_FLAG="--model-type"
+  MODEL_TYPE="alphafold2_multimer_v3"
+elif echo "$HELP" | grep -q -- "--models"; then
+  MODEL_FLAG="--models"
+  MODEL_TYPE="AlphaFold2_multimer_v3"
+fi
+
+TEMPLATE_OPT=""
+if [ "$USE_TEMPLATE" = "True" ] || [ "$USE_TEMPLATE" = "true" ]; then
+  if echo "$HELP" | grep -q -- "--templates"; then
+    TEMPLATE_OPT="--templates"
+  fi
+  if echo "$HELP" | grep -q -- "--custom-template-path"; then
+    TEMPLATE_OPT="$TEMPLATE_OPT --custom-template-path $TEMPLATE_DIR"
+  fi
+fi
+
+AMBER_FLAG=""
+if echo "$HELP" | grep -q -- "--amber"; then
+  if [ "$AMBER" = "True" ] || [ "$AMBER" = "true" ]; then
+    AMBER_FLAG="--amber"
+  fi
+elif echo "$HELP" | grep -q -- "--use-gpu-relax"; then
+  if [ "$AMBER" = "True" ] || [ "$AMBER" = "true" ]; then
+    AMBER_FLAG="--use-gpu-relax"
+  fi
+fi
+
+echo "[INFO] Running ColabFold with flags: ${MODEL_FLAG:+$MODEL_FLAG $MODEL_TYPE} --num-recycle $NUM_RECYCLES --num-models $NUM_MODELS $TEMPLATE_OPT ${AMBER_FLAG:+$AMBER_FLAG} $GPU_OPT"
+
+# 并发设置
+MAXJ=$(python scripts/get_param_yaml.py $PARAMS compute.max_concurrent_af2_initial)
+sem=$(which sem || true)
+if [ -z "$sem" ]; then
+  echo "[WARN] 'sem' not found; running sequentially."
+  MAXJ=1
+fi
+
+for fasta in $fasta_files; do
+  output_subdir="$OUTDIR/predictions/$(basename "$fasta" .fa)"
+  mkdir -p "$output_subdir"
+  full_cmd="$COLABFOLD ${MODEL_FLAG:+$MODEL_FLAG $MODEL_TYPE} --num-recycle \"$NUM_RECYCLES\" --num-models \"$NUM_MODELS\" $TEMPLATE_OPT ${AMBER_FLAG:+$AMBER_FLAG} $GPU_OPT \"$fasta\" \"$output_subdir\""
+  echo "[DEBUG] $full_cmd" >> "$LOGFILE"
+
+  run_one() {
+    eval $full_cmd 2>>"$LOGFILE"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      echo "[ERROR] ColabFold failed for $fasta (rc=$rc)" >> "$LOGFILE"
+    else
+      echo "[OK] Processed $fasta" >> "$LOGFILE"
+    fi
+  }
+
+  if [ "$MAXJ" -gt 1 ]; then
+    sem -j "$MAXJ" --id af2i --eval "run_one"
+  else
+    run_one
+  fi
+done
+
+if [ "$MAXJ" -gt 1 ]; then sem --id af2i --wait; fi
+echo "[OK] AF2-Multimer initial predictions → $OUTDIR/predictions. Log: $LOGFILE"
