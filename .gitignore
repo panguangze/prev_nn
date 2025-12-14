@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output directories
+outputs/
+outputs_*/
+
+# Temporary files
+tmp/
+*.tmp
+tmp_*.pdb
+
+# Logs
+*.log
+*.out
+*.err
+
+# Backup files
+*.bk
+*.bak
+*.old
+*~
+
+# Data (large files)
+# Uncomment if you don't want to track data
+# data/*.pdb
+# data/templates/
+
+# External repositories (should be cloned separately)
+external/
+
+# SLURM files
+slurm-*.out
+slurm-*.err
